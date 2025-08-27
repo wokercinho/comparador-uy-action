@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import httpx, re, time, os
 from urllib.parse import quote_plus  # importante para escapar la query
+import unicodedata
 
 app = FastAPI(title="Comparador Mayorista UY (Action)")
 
@@ -64,36 +65,101 @@ def _score(name: str, toks):
     name = (name or "").lower()
     return sum(1 for t in toks if t and t in name)
 
+def _normalize(s: str) -> str:
+    # minúsculas + sin acentos
+    s = s.lower().strip()
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", s)
+
+def _build_tries(q: str):
+    q0 = _normalize(q)
+    toks = q0.split()
+
+    # detectar "0000" (suele ser harina; para arroz estorba)
+    if "0000" in toks and "harina" not in toks:
+        toks_sin_0000 = [t for t in toks if t != "0000"]
+    else:
+        toks_sin_0000 = toks[:]
+
+    # quitar tamaños y unidades (1kg, 1 kg, 1000g)
+    toks_sin_size = [t for t in toks_sin_0000 if not re.fullmatch(r"(?:\d+kg|\d+\s*kg|\d+g|\d+\s*g|1kg|1\s*kg|1000g|1000\s*g)", t)]
+
+    tries = []
+    def add_try(tokens):
+        s = " ".join(tokens).strip()
+        if s and s not in tries:
+            tries.append(s)
+
+    add_try(q0)                          # 1) tal cual normalizado
+    add_try(" ".join(toks_sin_0000))     # 2) sin "0000" si aplica
+    add_try(" ".join(toks_sin_size))     # 3) sin tamaño
+
+    # 4) primeras 2 palabras (ej: "arroz shiva")
+    if len(toks_sin_size) >= 2:
+        add_try(" ".join(toks_sin_size[:2]))
+    # 5) primera palabra (ej: "arroz")
+    if len(toks_sin_size) >= 1:
+        add_try(toks_sin_size[0])
+
+    return tries
+
+def _fetch_vtex_products_tata(query: str):
+    # usamos ft= + sc=1 + paginado básico
+    base = "https://tata.com.uy/api/catalog_system/pub/products/search"
+    params = f"?ft={quote_plus(query)}&sc=1&_from=0&_to=24"
+    url = base + params
+    with httpx.Client(timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as cli:
+        r = cli.get(url, follow_redirects=True)
+        if r.status_code != 200:
+            return []
+        try:
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
 def _best_vtex_tata(q: str) -> Optional[Dict[str, Any]]:
-    key = f"tata:{q.lower()}"
+    # cache 12 horas por consulta original
+    key = f"tata:{_normalize(q)}"
     now = time.time()
     hit = _cache.get(key)
     if hit and now - hit["ts"] < 12 * 3600:
         return hit["data"]
 
-    toks = re.findall(r"[A-Za-zÁÉÍÓÚÜÑ0-9]+", q, re.I)
-    data = None
-    try:
-        with httpx.Client(timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as cli:
-            url = VTEX_TATA + quote_plus(q)
-            r = cli.get(url, follow_redirects=True)
-            r.raise_for_status()
-            arr = r.json()
-            if isinstance(arr, list) and arr:
-                toks_lower = [t.lower() for t in toks]
-                arr.sort(
-                    key=lambda p: _score(
-                        f"{p.get('productName','')} {p.get('linkText','')}",
-                        toks_lower
-                    ),
-                    reverse=True
-                )
-                data = arr[0]
-    except Exception:
-        data = None
+    tries = _build_tries(q)
+    best = None
+    best_score = -1
 
-    _cache[key] = {"ts": now, "data": data}
-    return data
+    # tokens para score (de la consulta original)
+    toks_score = re.findall(r"[A-Za-zÁÉÍÓÚÜÑ0-9]+", q, re.I)
+    toks_lower = [t.lower() for t in toks_score]
+
+    for t in tries:
+        arr = _fetch_vtex_products_tata(t)
+        if not arr:
+            continue
+        # rankear por coincidencias de tokens + preferir 1kg si venía en la query
+        def score_product(p):
+            name = f"{p.get('productName','')} {p.get('linkText','')}".lower()
+            base_score = sum(1 for tok in toks_lower if tok and tok in name)
+            # bonus si detectamos 1kg y aparece en el nombre
+            has_1kg = any(x in _normalize(q) for x in ["1kg", "1 kg", "1000g", "1000 g"])
+            if has_1kg and ("1kg" in name or "1 kg" in name or "1000g" in name or "1000 g" in name):
+                base_score += 1
+            return base_score
+
+        arr.sort(key=score_product, reverse=True)
+        cand = arr[0]
+        sc = score_product(cand)
+        if sc > best_score:
+            best, best_score = cand, sc
+        if best_score >= 2:
+            break  # suficientemente bueno
+
+    _cache[key] = {"ts": now, "data": best}
+    return best
+
 
 @app.post("/compare", response_model=CompareOut)
 def compare(body: CompareIn, x_api_key: str = Header(None)):
