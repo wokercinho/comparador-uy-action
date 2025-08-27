@@ -10,49 +10,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# ---------- Playwright (navegador real) ----------
+# Playwright (usado por request, sin globals)
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-_play = None
-_browser = None
-_context = None
-
-def _ensure_browser():
-    """Arranca Chromium una sola vez (modo headless)."""
-    global _play, _browser, _context
-    if _browser:
-        return
-    _play = sync_playwright().start()
-    _browser = _play.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-setuid-sandbox",
-        ],
-    )
-    _context = _browser.new_context(
-        locale="es-UY",
-        user_agent=(
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
-        ),
-    )
-
-def _close_browser():
-    global _play, _browser, _context
-    try:
-        if _context: _context.close()
-        if _browser: _browser.close()
-        if _play: _play.stop()
-    except Exception:
-        pass
-    finally:
-        _play = _browser = _context = None
-
 # ---------- FastAPI ----------
-app = FastAPI(title="Comparador UY (browser fallback)", version="2.0.0")
+app = FastAPI(title="Comparador UY (browser per-request)", version="2.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -60,17 +22,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.on_event("startup")
-def _startup():
-    try:
-        _ensure_browser()
-    except Exception as e:
-        print("[BOOT] Playwright no iniciado:", e)
-
-@app.on_event("shutdown")
-def _shutdown():
-    _close_browser()
 
 # ---------- Modelos ----------
 class CompareIn(BaseModel):
@@ -82,7 +33,7 @@ class CompareIn(BaseModel):
 
 class ItemResult(BaseModel):
     input: str
-    status: str                 # OK | Sin stock | No disponible | Error
+    status: str                 # OK | Sin stock | No disponible | Error | No implementado
     name: Optional[str] = None
     price: Optional[float] = None
     listPrice: Optional[float] = None
@@ -97,12 +48,13 @@ class CompareOut(BaseModel):
     count: int
     results: List[ItemResult]
 
-# ---------- Utilidades ----------
+# ---------- Utils ----------
 _cache = {}
 
 BRANDS = {
-    "emigrante","shiva","maggi","knorr","costa","cololo","cocinero","alco","himalaya",
-    "bella","union","bella union","arcor","nativa","yerba","delicias"
+    "emigrante","shiva","maggi","knorr","costa","cololo","cocinero",
+    "alco","himalaya","bella","union","bella union","arcor","nativa",
+    "yerba","delicias","cimarron","marolio","adonis","san remo"
 }
 _STOP = {"de","la","el","los","las","un","una","con","en","a","y","x","sin","al","por","para","del"}
 
@@ -132,6 +84,7 @@ def _is_noise(t: str) -> bool:
 
 def _build_tries(q: str) -> List[str]:
     toks = _normalize(q).split()
+    # Regla especial: "0000" suele ensuciar excepto HARINA 0000
     if "0000" in toks and "harina" not in toks:
         toks = [t for t in toks if t != "0000"]
     toks_clean = [t for t in toks if not _is_noise(t)]
@@ -140,15 +93,15 @@ def _build_tries(q: str) -> List[str]:
         s = " ".join(tokens).strip()
         if s and s not in tries:
             tries.append(s)
-    add_try(toks)
-    add_try(toks_clean)
-    if len(toks_clean) >= 2:
+    add_try(toks)              # completo
+    add_try(toks_clean)        # limpio
+    if len(toks_clean) >= 2:   # primeras 2 palabras
         add_try(toks_clean[:2])
-        add_try([toks_clean[1], toks_clean[0]])
+        add_try([toks_clean[1], toks_clean[0]])  # invertido
     marcas = [t for t in toks_clean if t in BRANDS]
     if marcas: add_try(marcas[:1])
     for t in toks_clean:
-        if len(t) >= 4: add_try([t])
+        if len(t) >= 4: add_try([t])             # token suelto (>=4)
     return tries
 
 def _parse_price(txt: str) -> Optional[float]:
@@ -165,7 +118,7 @@ def _parse_price(txt: str) -> Optional[float]:
 def _strip_tags(s: str) -> str:
     return re.sub(r"<[^>]+>", " ", s or "")
 
-# ---------- Fetch TATA rápido (HTTP) ----------
+# ---------- Fetch TATA: rápido por HTTP ----------
 def _fetch_vtex_json_tata(query: str):
     base = "https://tata.com.uy/api/catalog_system/pub/products/search"
     urls = [
@@ -177,16 +130,18 @@ def _fetch_vtex_json_tata(query: str):
         for url in urls:
             try:
                 r = cli.get(url, follow_redirects=True)
-                if r.status_code != 200: continue
+                if r.status_code != 200:
+                    continue
                 data = r.json()
-                if isinstance(data, list) and data: return data
+                if isinstance(data, list) and data:
+                    return data
             except Exception as e:
                 print("[TATA][JSON] error:", e)
                 continue
     return []
 
 def _fetch_busca_html_tata(query: str):
-    """Fallback liviano: /busca HTML (sin ejecutar JS)."""
+    """Fallback liviano: /busca HTML (sin JS)."""
     urls = [
         f"https://tata.com.uy/busca?ft={quote_plus(query)}&O=OrderByScoreDESC",
         f"https://www.tata.com.uy/busca?ft={quote_plus(query)}&O=OrderByScoreDESC",
@@ -197,8 +152,10 @@ def _fetch_busca_html_tata(query: str):
         for url in urls:
             try:
                 r = cli.get(url, follow_redirects=True)
-                if r.status_code != 200: continue
+                if r.status_code != 200:
+                    continue
                 html = r.text
+                # Captura anchors a PDP + precio que suele renderizar en SSR
                 for href, precio in re.findall(r'href="(/[^"]+/p)".{0,500}?\$ ?([\d\.\,]+)', html, re.I | re.S):
                     slug = href.strip("/").split("/")[0]
                     name_guess = _normalize(slug).replace("-", " ")
@@ -218,16 +175,16 @@ def _fetch_busca_html_tata(query: str):
                 continue
     return res
 
-# ---------- Fallback fuerte: navegador real (Playwright) ----------
+# ---------- Fallback fuerte: navegador real (por request) ----------
 def _pdp_from_page(page, url: str) -> dict:
-    """Abre PDP y extrae nombre + precio de forma robusta."""
+    """Abre PDP y extrae nombre + precio (robusto)."""
     full = url if url.startswith("http") else ("https://tata.com.uy" + url)
     page.goto(full, wait_until="domcontentloaded", timeout=45000)
-    page.wait_for_timeout(600)
+    page.wait_for_timeout(700)
 
     html = page.content()
 
-    # nombre
+    # Nombre
     name = None
     try:
         name = page.locator("h1").first.text_content(timeout=3000)
@@ -238,13 +195,13 @@ def _pdp_from_page(page, url: str) -> dict:
         m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
         name = _strip_tags(m.group(1)).strip() if m else None
 
-    # precio (varios patrones)
+    # Precio (varios patrones)
     price = None
     for pat in [
-        r'\$ ?([\d\.\,]+)\s*</',
+        r'itemprop="price"\s+content="([0-9]+(?:[\.,][0-9]+)?)"',
         r'"Price"\s*:\s*([0-9]+(?:[\.,][0-9]+)?)',
         r'"ListPrice"\s*:\s*([0-9]+(?:[\.,][0-9]+)?)',
-        r'itemprop="price"\s+content="([0-9]+(?:[\.,][0-9]+)?)"',
+        r'\$ ?([\d\.\,]+)\s*</',
         r'"price"\s*:\s*"([0-9]+(?:[\.,][0-9]+)?)"',
     ]:
         m = re.search(pat, html, re.I | re.S)
@@ -253,7 +210,7 @@ def _pdp_from_page(page, url: str) -> dict:
             if price is not None:
                 break
 
-    # slug
+    # Slug
     path = re.sub(r"https?://[^/]+", "", full)
     parts = [p for p in path.split("/") if p]
     slug = parts[-2] if parts and parts[-1] == "p" else (parts[-1] if parts else "")
@@ -273,48 +230,59 @@ def _pdp_from_page(page, url: str) -> dict:
     }
 
 def _search_with_browser_tata(query: str):
-    """Abre la búsqueda /busca y entra a 1-3 PDPs para confirmar datos."""
-    _ensure_browser()
-    page = _context.new_page()
-    try:
-        url = f"https://tata.com.uy/busca?ft={quote_plus(query)}&O=OrderByScoreDESC"
-        page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        page.wait_for_timeout(800)
-
-        # Si aparece selector de ubicación, intentá elegir Durazno (best effort)
+    """Abre /busca, toma 1–3 PDPs y devuelve candidatos. (Browser por request)"""
+    results = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu","--disable-setuid-sandbox"],
+        )
+        context = browser.new_context(
+            locale="es-UY",
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+            ),
+        )
+        page = context.new_page()
         try:
-            el = page.get_by_text("Durazno", exact=True).first
-            if el.is_visible():
-                el.click()
-                page.wait_for_timeout(500)
-        except Exception:
-            pass
+            url = f"https://tata.com.uy/busca?ft={quote_plus(query)}&O=OrderByScoreDESC"
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            page.wait_for_timeout(800)
 
-        anchors = page.locator('a[href$="/p"]').all()[:3]
-        results = []
-        for a in anchors:
+            # Intento de seleccionar "Durazno" si aparece la UI (best effort)
             try:
-                href = a.get_attribute("href")
-                if href:
-                    prod = _pdp_from_page(page, href)
-                    results.append(prod)
-            except Exception as e:
-                print("[TATA][PW] PDP error:", e)
-                continue
-        return results
-    except PWTimeoutError:
-        print("[TATA][PW] timeout en /busca")
-        return []
-    except Exception as e:
-        print("[TATA][PW] error:", e)
-        return []
-    finally:
-        try:
-            page.close()
-        except Exception:
-            pass
+                el = page.get_by_text("Durazno", exact=True).first
+                if el.is_visible():
+                    el.click()
+                    page.wait_for_timeout(500)
+            except Exception:
+                pass
 
-# ---------- Scoring y helpers ----------
+            anchors = page.locator('a[href$="/p"]').all()[:3]
+            for a in anchors:
+                try:
+                    href = a.get_attribute("href")
+                    if href:
+                        prod = _pdp_from_page(page, href)
+                        results.append(prod)
+                except Exception as e:
+                    print("[TATA][PW] PDP error:", e)
+                    continue
+        except PWTimeoutError:
+            print("[TATA][PW] timeout en /busca")
+        except Exception as e:
+            print("[TATA][PW] error:", e)
+        finally:
+            try: page.close()
+            except: pass
+            try: context.close()
+            except: pass
+            try: browser.close()
+            except: pass
+    return results
+
+# ---------- Scoring ----------
 def _score_product_from_query(p: dict, q_tokens: List[str], q_masses, q_vols, has_brand: bool) -> int:
     name = _normalize(f"{p.get('productName','')} {p.get('linkText','')}")
     s = 0
@@ -355,7 +323,7 @@ def _build_tata_url(product: dict) -> Optional[str]:
     return f"https://tata.com.uy/{slug}/p"
 
 def _fetch_products_tata(query: str):
-    """Cascada: JSON VTEX -> HTML liviano -> Navegador real."""
+    """Cascada: JSON VTEX -> HTML liviano -> Browser (por request)."""
     arr = _fetch_vtex_json_tata(query)
     if arr: return arr
     arr = _fetch_busca_html_tata(query)
@@ -397,8 +365,17 @@ def root():
 
 @app.post("/compare", response_model=CompareOut)
 def compare(inb: CompareIn):
-    if inb.competitor.lower().strip() != "tata":
-        return CompareOut(competitor=inb.competitor, store=inb.store, offset=inb.offset, limit=inb.limit, count=0, results=[])
+    comp = inb.competitor.lower().strip()
+    if comp != "tata":
+        # Para que el GPT no confunda "sin resultados" con "no implementado"
+        return CompareOut(
+            competitor=inb.competitor,
+            store=inb.store,
+            offset=inb.offset,
+            limit=inb.limit,
+            count=0,
+            results=[ItemResult(input="", status="No implementado", notes="Sólo TATA implementado en este servicio")]
+        )
 
     items = inb.items or []
     start = max(inb.offset, 0)
@@ -416,7 +393,7 @@ def compare(inb: CompareIn):
 
             price, list_price, available = _extract_prices(prod)
             url = _build_tata_url(prod)
-            name = prod.get("productName") or _normalize(prod.get("linkText", "")).replace("-", " ")
+            name = (prod.get("productName") or _normalize(prod.get("linkText", "")).replace("-", " ")).strip()
 
             if price is None:
                 results.append(ItemResult(input=q, status="No disponible", name=name, url=url, notes="Sin precio"))
@@ -428,8 +405,5 @@ def compare(inb: CompareIn):
             results.append(ItemResult(input=q, status="Error", notes=f"{type(e).__name__}: {e}"))
 
     return CompareOut(competitor="TATA", store=inb.store, offset=inb.offset, limit=inb.limit, count=len(results), results=results)
-
-# Nota Render:
-# Build Command: pip install -r requirements.txt && python -m playwright install --with-deps chromium
-# Start Command: uvicorn main:app --host 0.0.0.0 --port $PORT
 # ================== fin main.py ===================
+
