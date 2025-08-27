@@ -2,8 +2,9 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import httpx, re, time, os
-from urllib.parse import quote_plus  # importante para escapar la query
+from urllib.parse import quote_plus
 import unicodedata
+
 
 app = FastAPI(title="Comparador Mayorista UY (Action)")
 
@@ -66,24 +67,34 @@ def _score(name: str, toks):
     return sum(1 for t in toks if t and t in name)
 
 def _normalize(s: str) -> str:
-    # minúsculas + sin acentos
+    # minúsculas + sin acentos y espacios normalizados
     s = s.lower().strip()
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     return re.sub(r"\s+", " ", s)
 
+_STOP = {
+    "de","la","el","los","las","un","una","con","en","a","y","x","sin","al","por","para","del"
+}
+
 def _build_tries(q: str):
     q0 = _normalize(q)
     toks = q0.split()
 
-    # detectar "0000" (suele ser harina; para arroz estorba)
-    if "0000" in toks and "harina" not in toks:
-        toks_sin_0000 = [t for t in toks if t != "0000"]
-    else:
-        toks_sin_0000 = toks[:]
+    # quitar tamaños/unidades y "x3/x6", "pack", "pct"
+    def is_noise(t: str) -> bool:
+        if t in _STOP: return True
+        if re.fullmatch(r"\d+(kg|g|ml|l)", t): return True
+        if re.fullmatch(r"\d+\s*(kg|g|ml|l)", t): return True
+        if re.fullmatch(r"x\d+", t): return True
+        if t in {"pack","pct","bolsa","frasco","bot","pet"}: return True
+        return False
 
-    # quitar tamaños y unidades (1kg, 1 kg, 1000g)
-    toks_sin_size = [t for t in toks_sin_0000 if not re.fullmatch(r"(?:\d+kg|\d+\s*kg|\d+g|\d+\s*g|1kg|1\s*kg|1000g|1000\s*g)", t)]
+    toks_clean = [t for t in toks if not is_noise(t)]
+
+    # quitar "0000" si no hay "harina"
+    if "0000" in toks_clean and "harina" not in toks_clean:
+        toks_clean = [t for t in toks_clean if t != "0000"]
 
     tries = []
     def add_try(tokens):
@@ -91,23 +102,26 @@ def _build_tries(q: str):
         if s and s not in tries:
             tries.append(s)
 
-    add_try(q0)                          # 1) tal cual normalizado
-    add_try(" ".join(toks_sin_0000))     # 2) sin "0000" si aplica
-    add_try(" ".join(toks_sin_size))     # 3) sin tamaño
-
-    # 4) primeras 2 palabras (ej: "arroz shiva")
-    if len(toks_sin_size) >= 2:
-        add_try(" ".join(toks_sin_size[:2]))
-    # 5) primera palabra (ej: "arroz")
-    if len(toks_sin_size) >= 1:
-        add_try(toks_sin_size[0])
+    # 1) tal cual normalizado
+    add_try(toks)
+    # 2) limpio de ruidos
+    add_try(toks_clean)
+    # 3) primera pareja fuerte (dos primeras limpias)
+    if len(toks_clean) >= 2:
+        add_try(toks_clean[:2])
+        # 3b) invertida (útil p/ “emigrante aceitunas”)
+        add_try([toks_clean[1], toks_clean[0]])
+    # 4) token a token (>=4 letras)
+    for t in toks_clean:
+        if len(t) >= 4:
+            add_try([t])
 
     return tries
 
 def _fetch_vtex_products_tata(query: str):
-    # usamos ft= + sc=1 + paginado básico
+    # ampliar ventana y ordenar por score
     base = "https://tata.com.uy/api/catalog_system/pub/products/search"
-    params = f"?ft={quote_plus(query)}&sc=1&_from=0&_to=24"
+    params = f"?ft={quote_plus(query)}&_from=0&_to=49&O=OrderByScoreDESC"
     url = base + params
     with httpx.Client(timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as cli:
         r = cli.get(url, follow_redirects=True)
@@ -120,7 +134,6 @@ def _fetch_vtex_products_tata(query: str):
             return []
 
 def _best_vtex_tata(q: str) -> Optional[Dict[str, Any]]:
-    # cache 12 horas por consulta original
     key = f"tata:{_normalize(q)}"
     now = time.time()
     hit = _cache.get(key)
@@ -131,34 +144,39 @@ def _best_vtex_tata(q: str) -> Optional[Dict[str, Any]]:
     best = None
     best_score = -1
 
-    # tokens para score (de la consulta original)
-    toks_score = re.findall(r"[A-Za-zÁÉÍÓÚÜÑ0-9]+", q, re.I)
-    toks_lower = [t.lower() for t in toks_score]
+    toks_score = re.findall(r"[A-Za-zÁÉÍÓÚÜÑ0-9]+", _normalize(q))
+    has_1kg = any(x in _normalize(q) for x in ["1kg","1000g"])
+    has_brand = any(b in _normalize(q) for b in ["emigrante","shiva","maggi","knorr","costa","cololo","cocinero","alco","himalaya"])
 
     for t in tries:
         arr = _fetch_vtex_products_tata(t)
         if not arr:
             continue
-        # rankear por coincidencias de tokens + preferir 1kg si venía en la query
+
         def score_product(p):
             name = f"{p.get('productName','')} {p.get('linkText','')}".lower()
-            base_score = sum(1 for tok in toks_lower if tok and tok in name)
-            # bonus si detectamos 1kg y aparece en el nombre
-            has_1kg = any(x in _normalize(q) for x in ["1kg", "1 kg", "1000g", "1000 g"])
-            if has_1kg and ("1kg" in name or "1 kg" in name or "1000g" in name or "1000 g" in name):
-                base_score += 1
-            return base_score
+            s = 0
+            for tok in toks_score:
+                if tok and tok in name:
+                    s += 1
+            if has_1kg and ("1kg" in name or "1000g" in name or "1 kg" in name or "1000 g" in name):
+                s += 1
+            if has_brand and any(b in name for b in ["emigrante","shiva","maggi","knorr","costa","cololo","cocinero","alco","himalaya"]):
+                s += 1
+            return s
 
         arr.sort(key=score_product, reverse=True)
         cand = arr[0]
         sc = score_product(cand)
         if sc > best_score:
             best, best_score = cand, sc
+        # umbral razonable para cortar temprano
         if best_score >= 2:
-            break  # suficientemente bueno
+            break
 
     _cache[key] = {"ts": now, "data": best}
     return best
+
 
 
 @app.post("/compare", response_model=CompareOut)
