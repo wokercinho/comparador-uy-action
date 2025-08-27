@@ -11,11 +11,19 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-# Playwright por request (evita "cannot switch to a different thread")
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+# ---- Playwright opcional (último recurso) ----
+PLAYWRIGHT_AVAILABLE = False
+USE_BROWSER_FALLBACK = os.getenv("USE_BROWSER_FALLBACK", "0") == "1"
+try:
+    if USE_BROWSER_FALLBACK:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+        PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    PLAYWRIGHT_AVAILABLE = False
+    USE_BROWSER_FALLBACK = False
 
 # ---------- FastAPI ----------
-app = FastAPI(title="Comparador UY (multi-competidor)", version="3.0.0")
+app = FastAPI(title="Comparador UY (multi-competidor)", version="3.0.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,9 +57,7 @@ class CompareOut(BaseModel):
     count: int
     results: List[ItemResult]
 
-# ---------- Config por competidor ----------
-# Podés sobreescribir dominios sin tocar código con variables de entorno:
-#   TATA_BASE, ELDORADO_BASE, ELCLON_BASE, MILY_BASE
+# ---------- Config por competidor (sobre-escribibles por ENV) ----------
 BASES = {
     "tata":     os.getenv("TATA_BASE",     "https://tata.com.uy"),
     "eldorado": os.getenv("ELDORADO_BASE", "https://www.eldorado.com.uy"),
@@ -59,7 +65,7 @@ BASES = {
     "mily":     os.getenv("MILY_BASE",     "https://www.mily.com.uy"),
 }
 
-# muchos sitios en UY usan VTEX; probamos JSON VTEX -> /busca (SSR) -> Browser
+# Cache simple de 6hs
 _CACHE: Dict[str, dict] = {}
 
 BRANDS = {
@@ -96,7 +102,7 @@ def _is_noise(t: str) -> bool:
 
 def _build_tries(q: str) -> List[str]:
     toks = _normalize(q).split()
-    # Regla: "0000" sólo útil con HARINA
+    # "0000" sólo útil con HARINA
     if "0000" in toks and "harina" not in toks:
         toks = [t for t in toks if t != "0000"]
     toks_clean = [t for t in toks if not _is_noise(t)]
@@ -170,13 +176,37 @@ def _build_pdp_url(base: str, product: dict) -> Optional[str]:
     base = base.rstrip("/")
     return f"{base}/{slug}/p"
 
-# ---------- Estrategias de búsqueda por dominio ----------
+# ---------- Lectura de precio desde PDP (HTTPX) ----------
+def _price_from_pdp_httpx(full_url: str) -> Optional[float]:
+    headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "es-UY,es;q=0.9"}
+    try:
+        with httpx.Client(timeout=15, headers=headers, follow_redirects=True) as cli:
+            r = cli.get(full_url)
+            if r.status_code != 200:
+                return None
+            html = r.text
+            for pat in [
+                r'itemprop="price"\s+content="([0-9]+(?:[\.,][0-9]+)?)"',
+                r'"price"\s*:\s*"([0-9]+(?:[\.,][0-9]+)?)"',
+                r'"Price"\s*:\s*([0-9]+(?:[\.,][0-9]+)?)',
+                r'"ListPrice"\s*:\s*([0-9]+(?:[\.,][0-9]+)?)',
+                r'\$ ?([\d\.\,]+)\s*</',
+            ]:
+                m = re.search(pat, html, re.I | re.S)
+                if m:
+                    val = _parse_price(m.group(1))
+                    if val is not None:
+                        return val
+    except Exception:
+        pass
+    return None
+
+# ---------- Estrategias de búsqueda ----------
 def _fetch_vtex_json(base: str, query: str):
     base = base.rstrip("/")
-    # 2 variantes típicas de VTEX
     urls = [
-        f"{base}/api/catalog_system/pub/products/search?ft={quote_plus(query)}&_from=0&_to=99&O=OrderByScoreDESC",
-        f"{base}/api/catalog_system/pub/products/search/{quote_plus(query)}?_from=0&_to=99&O=OrderByScoreDESC",
+        f"{base}/api/catalog_system/pub/products/search?ft={quote_plus(query)}&_from=0&_to=99&O=OrderByScoreDESC&sc=1",
+        f"{base}/api/catalog_system/pub/products/search/{quote_plus(query)}?_from=0&_to=99&O=OrderByScoreDESC&sc=1",
     ]
     headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "es-UY,es;q=0.9"}
     with httpx.Client(timeout=15, headers=headers) as cli:
@@ -193,45 +223,61 @@ def _fetch_vtex_json(base: str, query: str):
     return []
 
 def _fetch_busca_html(base: str, query: str):
-    """Fallback liviano: /busca SSR (si el sitio la provee)."""
+    """
+    Fallback liviano: leer /busca SSR. Muchas VTEX no muestran precio SSR.
+    Aquí tomamos links de PDP y vamos a la PDP a leer precio por HTTPX.
+    """
     base = base.rstrip("/")
     urls = [
-        f"{base}/busca?ft={quote_plus(query)}&O=OrderByScoreDESC",
-        f"{base}/busca?ft={quote_plus(query)}",
+        f"{base}/busca?ft={quote_plus(query)}&O=OrderByScoreDESC&sc=1",
+        f"{base}/busca?ft={quote_plus(query)}&sc=1",
     ]
     headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "es-UY,es;q=0.9"}
-    res = []
-    with httpx.Client(timeout=15, headers=headers) as cli:
+    found = []
+    seen = set()
+    with httpx.Client(timeout=15, headers=headers, follow_redirects=True) as cli:
         for url in urls:
             try:
-                r = cli.get(url, follow_redirects=True)
+                r = cli.get(url)
                 if r.status_code != 200:
                     continue
                 html = r.text
-                for href, precio in re.findall(r'href="(/[^"]+/p)".{0,500}?\$ ?([\d\.\,]+)', html, re.I | re.S):
+                # Hasta 5 PDPs máximo para no castigar
+                for href in re.findall(r'href="(/[^"]+/p)(?:\?[^"]*)?"', html, re.I):
+                    if href in seen:
+                        continue
+                    seen.add(href)
                     slug = href.strip("/").split("/")[0]
-                    name_guess = _normalize(slug).replace("-", " ")
-                    price = _parse_price(precio)
-                    res.append({
-                        "productName": name_guess,
+                    full = href if href.startswith("http") else (base + href)
+                    price = _price_from_pdp_httpx(full)
+                    found.append({
+                        "productName": _normalize(slug).replace("-", " "),
                         "linkText": slug,
                         "items": [{
                             "sellers": [{
-                                "commertialOffer": {"Price": price, "ListPrice": price, "IsAvailable": True}
+                                "commertialOffer": {
+                                    "Price": price,
+                                    "ListPrice": price,
+                                    "IsAvailable": True if price is not None else False
+                                }
                             }]
                         }]
                     })
-                if res:
+                    if len(found) >= 5:
+                        break
+                if found:
                     break
             except Exception:
                 continue
-    return res
+    return found
 
 def _search_with_browser(base: str, query: str, store_hint: str = ""):
-    """Fallback fuerte: abre /busca y visita 1–3 PDPs (browser por request)."""
+    """Fallback fuerte con navegador (opcional y desactivado por defecto)."""
+    if not (USE_BROWSER_FALLBACK and PLAYWRIGHT_AVAILABLE):
+        return []
     results = []
     base = base.rstrip("/")
-    search_url = f"{base}/busca?ft={quote_plus(query)}&O=OrderByScoreDESC"
+    search_url = f"{base}/busca?ft={quote_plus(query)}&O=OrderByScoreDESC&sc=1"
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -248,24 +294,12 @@ def _search_with_browser(base: str, query: str, store_hint: str = ""):
         try:
             page.goto(search_url, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_timeout(800)
-
-            # Best-effort de localización (si aparece)
-            if store_hint:
-                try:
-                    el = page.get_by_text(store_hint, exact=True).first
-                    if el.is_visible():
-                        el.click(timeout=2000)
-                        page.wait_for_timeout(500)
-                except Exception:
-                    pass
-
             anchors = page.locator('a[href$="/p"]').all()[:3]
             for a in anchors:
                 try:
                     href = a.get_attribute("href")
                     if not href:
                         continue
-                    # PDP
                     full = href if href.startswith("http") else (base + href)
                     page.goto(full, wait_until="domcontentloaded", timeout=45000)
                     page.wait_for_timeout(600)
@@ -315,8 +349,6 @@ def _search_with_browser(base: str, query: str, store_hint: str = ""):
                     })
                 except Exception:
                     continue
-        except PWTimeoutError:
-            pass
         except Exception:
             pass
         finally:
@@ -329,7 +361,7 @@ def _search_with_browser(base: str, query: str, store_hint: str = ""):
     return results
 
 def _fetch_products_generic(base: str, query: str, store_hint: str = ""):
-    """Cascada genérica para sitios (ideal VTEX): JSON -> /busca SSR -> Browser."""
+    """Cascada: JSON → /busca SSR → Browser (opcional)."""
     arr = _fetch_vtex_json(base, query)
     if arr: return arr
     arr = _fetch_busca_html(base, query)
@@ -379,7 +411,13 @@ HANDLERS: Dict[str, Callable[[str, str], Optional[dict]]] = {
 # ---------- Endpoints ----------
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "comparador-uy-multi", "bases": BASES, "ts": int(time.time())}
+    return {
+        "status": "ok",
+        "service": "comparador-uy-multi",
+        "bases": BASES,
+        "browser_fallback": PLAYWRIGHT_AVAILABLE and USE_BROWSER_FALLBACK,
+        "ts": int(time.time()),
+    }
 
 @app.post("/compare", response_model=CompareOut)
 def compare(inb: CompareIn):
@@ -391,7 +429,7 @@ def compare(inb: CompareIn):
             store=inb.store,
             offset=inb.offset,
             limit=inb.limit,
-            count: = 0,  # type: ignore
+            count=0,  # <— ESTA ERA LA LÍNEA CON ERROR
             results=[ItemResult(input="", status="No implementado", notes=f"Competidor '{comp}' no configurado")]
         )
 
@@ -407,14 +445,12 @@ def compare(inb: CompareIn):
         try:
             prod = handler(q, inb.store)
             if not prod:
-                results.append(ItemResult(input=q, status="No disponible", notes="Sin coincidencias (JSON/HTML/Browser)"))
+                results.append(ItemResult(input=q, status="No disponible", notes="Sin coincidencias (JSON/HTML/PDP/Browser)"))
                 continue
 
             price, list_price, available = _extract_prices(prod)
             name = (prod.get("productName") or _normalize(prod.get("linkText","")).replace("-", " ")).strip()
-            url = None
-            if base:
-                url = _build_pdp_url(base, prod)
+            url = _build_pdp_url(base, prod) if base else None
 
             if price is None:
                 results.append(ItemResult(input=q, status="No disponible", name=name, url=url, notes="Sin precio"))
@@ -425,6 +461,12 @@ def compare(inb: CompareIn):
         except Exception as e:
             results.append(ItemResult(input=q, status="Error", notes=f"{type(e).__name__}: {e}"))
 
-    return CompareOut(competitor=inb.competitor.upper(), store=inb.store, offset=inb.offset, limit=inb.limit, count=len(results), results=results)
+    return CompareOut(
+        competitor=inb.competitor.upper(),
+        store=inb.store,
+        offset=inb.offset,
+        limit=inb.limit,
+        count=len(results),
+        results=results
+    )
 # ================== fin main.py ===================
-
