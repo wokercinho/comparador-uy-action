@@ -6,6 +6,30 @@ import httpx, re, time, os
 API_KEY = os.getenv("API_KEY", "change_me")
 
 app = FastAPI(title="Comparador Mayorista UY (Action)")
+# Página raíz para que no confunda
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "comparador-uy-action"}
+
+# OpenAPI con 'servers' correcto:
+from fastapi.openapi.utils import get_openapi
+import os
+
+PUBLIC_URL = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_HOSTNAME")
+if PUBLIC_URL and not PUBLIC_URL.startswith("http"):
+    PUBLIC_URL = f"https://{PUBLIC_URL}"
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(title=app.title, version="1.0", routes=app.routes)
+    if PUBLIC_URL:
+        schema["servers"] = [{"url": PUBLIC_URL}]
+    app.openapi_schema = schema
+    return schema
+
+app.openapi = custom_openapi
+
 
 VTEX_TATA = "https://tata.com.uy/api/catalog_system/pub/products/search?ft="
 
