@@ -1,3 +1,4 @@
+from urllib.parse import quote_plus
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
@@ -69,8 +70,27 @@ def _best_vtex_tata(q: str) -> Optional[Dict[str, Any]]:
     key = f"tata:{q.lower()}"
     now = time.time()
     hit = _cache.get(key)
-    if hit and now - hit["ts"] < 12*3600:
+    if hit and now - hit["ts"] < 12 * 3600:
         return hit["data"]
+
+    toks = re.findall(r"[A-Za-zÁÉÍÓÚÜÑ0-9]+", q, re.I)
+    data = None
+    try:
+        with httpx.Client(timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as cli:
+            url = VTEX_TATA + quote_plus(q)  # ← antes usaba httpx.utils.quote()
+            r = cli.get(url, follow_redirects=True)
+            r.raise_for_status()
+            arr = r.json()
+            if isinstance(arr, list) and arr:
+                toks_lower = [t.lower() for t in toks]
+                arr.sort(key=lambda p: _score(f"{p.get('productName','')} {p.get('linkText','')}", toks_lower), reverse=True)
+                data = arr[0]
+    except Exception:
+        data = None
+
+    _cache[key] = {"ts": now, "data": data}
+    return data
+]
 
     toks = re.findall(r"[A-Za-zÁÉÍÓÚÜÑ0-9]+", q, re.I)
     with httpx.Client(timeout=12, headers={"User-Agent":"Mozilla/5.0"}) as cli:
