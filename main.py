@@ -240,4 +240,196 @@ def _pdp_from_page(page, url: str) -> dict:
 
     # precio (varios patrones)
     price = None
-    for pat
+    for pat in [
+        r'\$ ?([\d\.\,]+)\s*</',
+        r'"Price"\s*:\s*([0-9]+(?:[\.,][0-9]+)?)',
+        r'"ListPrice"\s*:\s*([0-9]+(?:[\.,][0-9]+)?)',
+        r'itemprop="price"\s+content="([0-9]+(?:[\.,][0-9]+)?)"',
+        r'"price"\s*:\s*"([0-9]+(?:[\.,][0-9]+)?)"',
+    ]:
+        m = re.search(pat, html, re.I | re.S)
+        if m:
+            price = _parse_price(m.group(1))
+            if price is not None:
+                break
+
+    # slug
+    path = re.sub(r"https?://[^/]+", "", full)
+    parts = [p for p in path.split("/") if p]
+    slug = parts[-2] if parts and parts[-1] == "p" else (parts[-1] if parts else "")
+
+    return {
+        "productName": name or _normalize(slug).replace("-", " "),
+        "linkText": slug,
+        "items": [{
+            "sellers": [{
+                "commertialOffer": {
+                    "Price": price,
+                    "ListPrice": price,
+                    "IsAvailable": True
+                }
+            }]
+        }]
+    }
+
+def _search_with_browser_tata(query: str):
+    """Abre la búsqueda /busca y entra a 1-3 PDPs para confirmar datos."""
+    _ensure_browser()
+    page = _context.new_page()
+    try:
+        url = f"https://tata.com.uy/busca?ft={quote_plus(query)}&O=OrderByScoreDESC"
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        page.wait_for_timeout(800)
+
+        # Si aparece selector de ubicación, intentá elegir Durazno (best effort)
+        try:
+            el = page.get_by_text("Durazno", exact=True).first
+            if el.is_visible():
+                el.click()
+                page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+        anchors = page.locator('a[href$="/p"]').all()[:3]
+        results = []
+        for a in anchors:
+            try:
+                href = a.get_attribute("href")
+                if href:
+                    prod = _pdp_from_page(page, href)
+                    results.append(prod)
+            except Exception as e:
+                print("[TATA][PW] PDP error:", e)
+                continue
+        return results
+    except PWTimeoutError:
+        print("[TATA][PW] timeout en /busca")
+        return []
+    except Exception as e:
+        print("[TATA][PW] error:", e)
+        return []
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+# ---------- Scoring y helpers ----------
+def _score_product_from_query(p: dict, q_tokens: List[str], q_masses, q_vols, has_brand: bool) -> int:
+    name = _normalize(f"{p.get('productName','')} {p.get('linkText','')}")
+    s = 0
+    for tok in q_tokens:
+        if tok and tok in name: s += 1
+    if has_brand and any(b in name for b in BRANDS): s += 2
+    pm, pv = _extract_sizes(name)
+    if q_masses and pm:
+        diff = min(abs(a-b) for a in q_masses for b in pm)
+        if min(q_masses) > 0:
+            pct = diff / float(min(q_masses))
+            s += 2 if pct <= 0.10 else (1 if pct <= 0.20 else 0)
+    if q_vols and pv:
+        diff = min(abs(a-b) for a in q_vols for b in pv)
+        if min(q_vols) > 0:
+            pct = diff / float(min(q_vols))
+            s += 2 if pct <= 0.10 else (1 if pct <= 0.20 else 0)
+    return s
+
+def _extract_prices(product: dict):
+    try:
+        for it in product.get("items", []) or []:
+            for seller in it.get("sellers", []) or []:
+                offer = seller.get("commertialOffer") or {}
+                price = offer.get("Price")
+                list_price = offer.get("ListPrice") or price
+                available = offer.get("IsAvailable", True)
+                if price is not None:
+                    return float(price), float(list_price or price), bool(available)
+    except Exception:
+        pass
+    return None, None, False
+
+def _build_tata_url(product: dict) -> Optional[str]:
+    slug = product.get("linkText")
+    if not slug: return None
+    slug = slug.strip("/")
+    return f"https://tata.com.uy/{slug}/p"
+
+def _fetch_products_tata(query: str):
+    """Cascada: JSON VTEX -> HTML liviano -> Navegador real."""
+    arr = _fetch_vtex_json_tata(query)
+    if arr: return arr
+    arr = _fetch_busca_html_tata(query)
+    if arr: return arr
+    arr = _search_with_browser_tata(query)
+    return arr or []
+
+def _best_tata(q: str):
+    key = f"tata:{_normalize(q)}"
+    now = time.time()
+    hit = _cache.get(key)
+    if hit and now - hit["ts"] < 6 * 3600:
+        return hit["data"]
+
+    tries = _build_tries(q)
+    best, best_score = None, -1
+    q_tokens = _normalize(q).split()
+    q_masses, q_vols = _extract_sizes(q)
+    has_brand = any(t in BRANDS for t in q_tokens)
+
+    for t in tries:
+        arr = _fetch_products_tata(t)
+        if not arr: continue
+        arr.sort(key=lambda p: _score_product_from_query(p, q_tokens, q_masses, q_vols, has_brand), reverse=True)
+        cand = arr[0]
+        sc = _score_product_from_query(cand, q_tokens, q_masses, q_vols, has_brand)
+        if sc > best_score:
+            best, best_score = cand, sc
+        if best_score >= 3:
+            break
+
+    _cache[key] = {"ts": now, "data": best}
+    return best
+
+# ---------- Endpoints ----------
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "comparador-uy-browser", "ts": int(time.time())}
+
+@app.post("/compare", response_model=CompareOut)
+def compare(inb: CompareIn):
+    if inb.competitor.lower().strip() != "tata":
+        return CompareOut(competitor=inb.competitor, store=inb.store, offset=inb.offset, limit=inb.limit, count=0, results=[])
+
+    items = inb.items or []
+    start = max(inb.offset, 0)
+    end = min(start + max(inb.limit, 1), len(items)) if items else start
+    slice_items = items[start:end] if items else []
+
+    results: List[ItemResult] = []
+
+    for q in slice_items:
+        try:
+            prod = _best_tata(q)
+            if not prod:
+                results.append(ItemResult(input=q, status="No disponible", notes="Sin coincidencias (JSON/HTML/Browser)"))
+                continue
+
+            price, list_price, available = _extract_prices(prod)
+            url = _build_tata_url(prod)
+            name = prod.get("productName") or _normalize(prod.get("linkText", "")).replace("-", " ")
+
+            if price is None:
+                results.append(ItemResult(input=q, status="No disponible", name=name, url=url, notes="Sin precio"))
+                continue
+
+            status = "OK" if available else "Sin stock"
+            results.append(ItemResult(input=q, status=status, name=name, price=price, listPrice=list_price, url=url))
+        except Exception as e:
+            results.append(ItemResult(input=q, status="Error", notes=f"{type(e).__name__}: {e}"))
+
+    return CompareOut(competitor="TATA", store=inb.store, offset=inb.offset, limit=inb.limit, count=len(results), results=results)
+
+# Nota Render:
+# Build Command: pip install -r requirements.txt && python -m playwright install --with-deps chromium
+# Start Command: uvicorn main:app --host 0.0.0.0 --port $PORT
+# ================== fin main.py ===================
