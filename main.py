@@ -66,35 +66,53 @@ def _score(name: str, toks):
     name = (name or "").lower()
     return sum(1 for t in toks if t and t in name)
 
+# ========= Matching mejorado para TATA (VTEX) con fallback HTML =========
+
+BRANDS = {
+    # marcas frecuentes; agregá las que uses
+    "emigrante","shiva","maggi","knorr","costa","cololo","cocinero","alco","himalaya",
+    # añadidos útiles
+    "bella","union","bella union"
+}
+
 def _normalize(s: str) -> str:
-    # minúsculas + sin acentos y espacios normalizados
-    s = s.lower().strip()
+    s = (s or "").lower().strip()
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    return re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^\w\s]", " ", s)        # fuera puntuación
+    return re.sub(r"\s+", " ", s).strip()
 
-_STOP = {
-    "de","la","el","los","las","un","una","con","en","a","y","x","sin","al","por","para","del"
-}
+_STOP = {"de","la","el","los","las","un","una","con","en","a","y","x","sin","al","por","para","del"}
+
+def _extract_sizes(text: str):
+    """Devuelve (masas_en_g, volumenes_en_ml) como sets de enteros."""
+    t = _normalize(text)
+    masses, vols = set(), set()
+    for m, unit in re.findall(r"(\d+)\s*(kg|g|gr)", t):
+        n = int(m)
+        masses.add(n*1000 if unit=="kg" else n)
+    for m, unit in re.findall(r"(\d+)\s*(ml|l)", t):
+        n = int(m)
+        vols.add(n*1000 if unit=="l" else n)
+    return masses, vols
+
+def _is_noise(t: str) -> bool:
+    if t in _STOP: return True
+    if re.fullmatch(r"\d+(kg|g|gr|ml|l)", t): return True
+    if re.fullmatch(r"\d+\s*(kg|g|gr|ml|l)", t): return True
+    if re.fullmatch(r"x\d+", t): return True     # packs 3x, 6x
+    if t in {"pack","pct","bolsa","frasco","bot","pet","unidad","un"}: return True
+    return False
 
 def _build_tries(q: str):
     q0 = _normalize(q)
     toks = q0.split()
 
-    # quitar tamaños/unidades y "x3/x6", "pack", "pct"
-    def is_noise(t: str) -> bool:
-        if t in _STOP: return True
-        if re.fullmatch(r"\d+(kg|g|ml|l)", t): return True
-        if re.fullmatch(r"\d+\s*(kg|g|ml|l)", t): return True
-        if re.fullmatch(r"x\d+", t): return True
-        if t in {"pack","pct","bolsa","frasco","bot","pet"}: return True
-        return False
+    # quitar "0000" cuando NO es harina
+    if "0000" in toks and "harina" not in toks:
+        toks = [t for t in toks if t != "0000"]
 
-    toks_clean = [t for t in toks if not is_noise(t)]
-
-    # quitar "0000" si no hay "harina"
-    if "0000" in toks_clean and "harina" not in toks_clean:
-        toks_clean = [t for t in toks_clean if t != "0000"]
+    toks_clean = [t for t in toks if not _is_noise(t)]
 
     tries = []
     def add_try(tokens):
@@ -106,39 +124,97 @@ def _build_tries(q: str):
     add_try(toks)
     # 2) limpio de ruidos
     add_try(toks_clean)
-    # 3) primera pareja fuerte (dos primeras limpias)
+    # 3) primeras dos palabras limpias y su inversa (marca+producto / producto+marca)
     if len(toks_clean) >= 2:
         add_try(toks_clean[:2])
-        # 3b) invertida (útil p/ “emigrante aceitunas”)
         add_try([toks_clean[1], toks_clean[0]])
-    # 4) token a token (>=4 letras)
+    # 4) solo marca si está
+    marcas_en_query = [t for t in toks_clean if t in BRANDS]
+    if marcas_en_query:
+        add_try(marcas_en_query[:1])
+    # 5) tokens fuertes (≥4 letras)
     for t in toks_clean:
         if len(t) >= 4:
             add_try([t])
 
     return tries
 
-def _fetch_vtex_products_tata(query: str):
-    # ampliar ventana y ordenar por score
-    base = "https://tata.com.uy/api/catalog_system/pub/products/search"
-    params = f"?ft={quote_plus(query)}&_from=0&_to=49&O=OrderByScoreDESC"
-    url = base + params
-    with httpx.Client(timeout=15, headers={"User-Agent": "Mozilla/5.0"}) as cli:
-        r = cli.get(url, follow_redirects=True)
-        if r.status_code != 200:
-            return []
-        try:
-            data = r.json()
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
+def _parse_price(txt: str) -> Optional[float]:
+    # "$ 1.234,50" -> 1234.5 ; "$53,00" -> 53.0
+    if not txt: return None
+    s = txt.replace("\xa0", " ").strip()
+    s = re.sub(r"[^0-9,\.]", "", s)
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
 
-def _best_vtex_tata(q: str) -> Optional[Dict[str, Any]]:
-    key = f"tata:{_normalize(q)}"
-    now = time.time()
-    hit = _cache.get(key)
-    if hit and now - hit["ts"] < 12 * 3600:
-        return hit["data"]
+def _fetch_vtex_json_tata(query: str):
+    base = "https://tata.com.uy/api/catalog_system/pub/products/search"
+    urls = [
+        f"{base}?ft={quote_plus(query)}&_from=0&_to=99&O=OrderByScoreDESC",
+        f"{base}/{quote_plus(query)}?_from=0&_to=99&O=OrderByScoreDESC",
+    ]
+    headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "es-UY,es;q=0.9"}
+    with httpx.Client(timeout=15, headers=headers) as cli:
+        for url in urls:
+            try:
+                r = cli.get(url, follow_redirects=True)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                if isinstance(data, list) and data:
+                    return data
+            except Exception:
+                continue
+    return []
+
+def _fetch_html_busca_tata(query: str):
+    # Fallback: página pública /busca (HTML)
+    urls = [
+        f"https://tata.com.uy/busca?ft={quote_plus(query)}&O=OrderByScoreDESC",
+        f"https://www.tata.com.uy/busca?ft={quote_plus(query)}&O=OrderByScoreDESC",
+    ]
+    headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "es-UY,es;q=0.9"}
+    results = []
+    with httpx.Client(timeout=15, headers=headers) as cli:
+        for url in urls:
+            try:
+                r = cli.get(url, follow_redirects=True)
+                if r.status_code != 200:
+                    continue
+                html = r.text
+                # anclas a PDP + precio cercano
+                for href, precio in re.findall(r'href="(/[^"]+/p)".{0,500}?\$ ?([\d\.\,]+)', html, re.I | re.S):
+                    slug = href.strip("/").split("/")[0]
+                    name_guess = _normalize(slug).replace("-", " ")
+                    price = _parse_price(precio)
+                    results.append({
+                        "productName": name_guess,
+                        "linkText": slug,
+                        "items": [{
+                            "sellers": [{
+                                "commertialOffer": {
+                                    "Price": price,
+                                    "ListPrice": price,
+                                    "IsAvailable": True
+                                }
+                            }]
+                        }]
+                    })
+                if results:
+                    break
+            except Exception:
+                continue
+    return results
+
+def _fetch_products_tata(query: str):
+    arr = _fetch_vtex
+
 
     tries = _build_tries(q)
     best = None
