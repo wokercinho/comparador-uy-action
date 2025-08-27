@@ -3,7 +3,8 @@ info:
   title: Comparador Mayorista UY (Action)
   version: "1.0"
 servers:
-  - url: https://YOUR-DEPLOY-URL   # replace after deploy (e.g., https://comparador-uy-action.onrender.com)
+  - url: https://comparador-uy-action.onrender.com
+
 paths:
   /compare:
     post:
