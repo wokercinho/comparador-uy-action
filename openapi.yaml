@@ -1,0 +1,77 @@
+openapi: 3.1.0
+info:
+  title: Comparador Mayorista UY (Action)
+  version: "1.0"
+servers:
+  - url: https://YOUR-DEPLOY-URL   # replace after deploy (e.g., https://comparador-uy-action.onrender.com)
+paths:
+  /compare:
+    post:
+      operationId: compareItems
+      description: >
+        Devuelve precios para hasta 300 artículos por llamada. Param 'competitor' acepta 'tata' por ahora.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [competitor, store, items]
+              properties:
+                competitor:
+                  type: string
+                  description: "tata | dorado | clon | superencasa | mily (por ahora implementado: tata)"
+                store:
+                  type: string
+                  description: "Localidad, ej: Durazno"
+                offset:
+                  type: integer
+                  default: 0
+                limit:
+                  type: integer
+                  default: 250
+                  maximum: 300
+                items:
+                  type: array
+                  maxItems: 300
+                  items: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  competitor:
+                    type: string
+                  store:
+                    type: string
+                  offset:
+                    type: integer
+                  limit:
+                    type: integer
+                  total:
+                    type: integer
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        idx: { type: integer }
+                        query: { type: string }
+                        name: { type: string, nullable: true }
+                        price: { type: number, nullable: true }
+                        listPrice: { type: number, nullable: true }
+                        inStock: { type: boolean, nullable: true }
+                        url: { type: string, nullable: true }
+                        exclusivoOnline: { type: boolean, nullable: true }
+                        estado: { type: string }
+security:
+  - apiKeyAuth: []
+components:
+  securitySchemes:
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: x-api-key
